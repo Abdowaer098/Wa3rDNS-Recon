@@ -1,4 +1,4 @@
-# wa3rdns 🌐
+# Wa3rdns 🌐
 
 **wa3rdns** is an advanced and highly concurrent reconnaissance tool designed for deep DNS, network, and ASN enumeration. It automates the process of gathering intelligence on a target domain by consolidating information from various sources into a structured output directory.
 
