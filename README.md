@@ -61,7 +61,7 @@ Follow these steps to install and configure `wa3rdns` for easy use from anywhere
 
 ```bash
 git clone https://github.com/Abdowaer098/Wa3rDNS-Recon.git
-cd wa3rdns
+cd Wa3rDNS-Recon
 ```
 
 **2. Install Python Dependencies**
