@@ -152,3 +152,6 @@ All results are saved in a uniquely named directory, for example: `recon_results
   - `masscan_open_ports.grep`: Greppable output from `masscan`.
   - `nmap_*.txt`: Output from `nmap` for each IPv6 address.
   - `reverse_dns_CIDR_HERE.json`: Reverse DNS results for scanned CIDR ranges.
+
+
+    ##By Abdelrahman Waer
