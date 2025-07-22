@@ -534,6 +534,9 @@ def scan_cidrs(cidrs, output_dir, resolver):
             color_print(f"    [-] Error processing CIDR {cidr}: {e}", Fore.RED)
 
 def main():
+    # Move the global declaration to the top of the function scope
+    global MAX_CIDR_IPS
+
     parser = argparse.ArgumentParser(description="Enhanced DNS and network reconnaissance tool with colored output.")
     parser.add_argument("target", help="Domain or URL to investigate")
     parser.add_argument("-o", "--output", default="recon_results", help="Output directory base name")
@@ -543,11 +546,12 @@ def main():
     parser.add_argument("--resolver", default="1.1.1.1", help="DNS resolver for reverse lookups")
     parser.add_argument("--scan-cidrs", help="CIDRs to scan (comma-separated or 'all')")
     parser.add_argument("--max-cidrs", type=int, help="Maximum number of CIDRs to scan")
-    parser.add_argument("--max-cidr-ips", type=int, default=MAX_CIDR_IPS, 
+    # Now this usage is valid because the name has been declared global
+    parser.add_argument("--max-cidr-ips", type=int, default=MAX_CIDR_IPS,
                         help=f"Maximum IPs per CIDR to scan (default: {MAX_CIDR_IPS})")
     args = parser.parse_args()
 
-    global MAX_CIDR_IPS
+    # Update the global variable with the (potentially new) value from the arguments
     MAX_CIDR_IPS = args.max_cidr_ips
 
     if args.scan_ports and os.geteuid() != 0:
