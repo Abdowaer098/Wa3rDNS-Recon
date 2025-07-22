@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+import json
+import argparse
+import ipaddress
+import subprocess
+import tempfile
+import concurrent.futures
+from datetime import datetime
+from urllib.parse import urlparse
+from threading import Thread, Lock
+import time
+
+# Try to import colorama for colored output
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+    COLORS = True
+except ImportError:
+    COLORS = False
+    class Fore:
+        RED = GREEN = YELLOW = BLUE = MAGENTA = CYAN = WHITE = ''
+    class Style:
+        BRIGHT = DIM = NORMAL = RESET_ALL = ''
+
+# Configuration
+DNS_TIMEOUT = None
+SSL_TIMEOUT = None
+ASN_TIMEOUT = None
+PORT_SCAN_TIMEOUT = None
+CIDR_SCAN_TIMEOUT = None
+MAX_WORKERS = 50  # Increased thread workers
+MAX_NMAP_WORKERS = 10  # Separate limit for nmap scans
+MAX_CIDR_IPS = 100000
+
+def color_print(text, color=Fore.WHITE, style=Style.NORMAL):
+    """Print colored text if colorama is available."""
+    if COLORS:
+        print(f"{style}{color}{text}{Style.RESET_ALL}")
+    else:
+        print(text)
+
+def run_command(args, timeout=None):
+    """Runs a shell command without timeout."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+        return result.stdout
+    except FileNotFoundError:
+        color_print(f"[-] Command not found: {args[0]}", Fore.RED)
+    except subprocess.TimeoutExpired:
+        color_print(f"[-] Command timed out: {' '.join(args)}", Fore.RED)
+    except Exception as e:
+        color_print(f"[-] Unexpected error running command: {e}", Fore.RED)
+    return ""
+
+def extract_domain(target):
+    """Extracts a valid domain from a URL or string."""
+    if not re.match(r'^https?://', target):
+        target = 'https://' + target
+    parsed = urlparse(target)
+    domain = parsed.netloc.split(':')[0]
+    if not re.match(r'^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$', domain):
+        raise ValueError(f"Invalid domain format: '{domain}'")
+    return domain
+
+def extract_ips(text):
+    """Extracts and validates unique public IP addresses."""
+    ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b|[a-fA-F0-9:]+:+[a-fA-F0-9:.]+'
+    candidates = re.findall(ip_pattern, text)
+    valid_ips = set()
+    for candidate in candidates:
+        try:
+            ip = ipaddress.ip_address(candidate)
+            if not ip.is_private and not ip.is_loopback and not ip.is_link_local:
+                valid_ips.add(str(ip))
+        except ValueError:
+            pass
+    return valid_ips
+
+def get_dns_info(domain):
+    """Gets DNS information using multiple methods with improved parallelism."""
+    ips = set()
+    other_records = []
+    
+    color_print("\n[+] Running comprehensive DNS reconnaissance...", Fore.CYAN, Style.BRIGHT)
+    
+    # dnsrecon scans
+    dnsrecon_cmds = [
+        ["dnsrecon", "-d", domain, "-a", "-b", "-y", "-k", "-s", "-z"],
+        ["dnsrecon", "-d", domain, "-t", "axfr"],
+        ["dnsrecon", "-d", domain, "-t", "srv"],
+        ["dnsrecon", "-d", domain, "-t", "spf"]
+    ]
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_cmd = {executor.submit(run_command, cmd, DNS_TIMEOUT): cmd for cmd in dnsrecon_cmds}
+        for future in concurrent.futures.as_completed(future_to_cmd):
+            output = future.result()
+            if output:
+                ips.update(extract_ips(output))
+    
+    # Additional DNS tools
+    dns_tools = [
+        ["dig", "+short", "A", domain],
+        ["dig", "+short", "AAAA", domain],
+        ["dig", "+short", "MX", domain],
+        ["dig", "+short", "TXT", domain],
+        ["dig", "+short", "NS", domain],
+        ["dig", "+short", "CNAME", domain],
+        ["dig", "+short", "PTR", domain],
+        ["dig", "+short", "SOA", domain],
+        ["host", "-t", "a", domain],
+        ["host", "-t", "aaaa", domain],
+        ["host", "-t", "mx", domain],
+        ["nslookup", "-query=A", domain],
+        ["nslookup", "-query=AAAA", domain],
+        ["nslookup", "-query=MX", domain]
+    ]
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_cmd = {executor.submit(run_command, cmd, DNS_TIMEOUT): cmd for cmd in dns_tools}
+        for future in concurrent.futures.as_completed(future_to_cmd):
+            output = future.result()
+            if output:
+                ips.update(extract_ips(output))
+    
+    # DNS brute forcing
+    color_print("[+] Running DNS brute force for common subdomains...", Fore.CYAN)
+    subdomains = {"www", "mail", "ftp", "webmail", "smtp", "pop", "imap", "ns1", "ns2", 
+                  "blog", "dev", "test", "staging", "api", "app", "cdn", "cloud", "shop",
+                  "mx", "email", "web", "portal", "support", "help", "admin", "secure",
+                  "vpn", "mail2", "ns3", "ns4", "static", "media", "assets", "beta",
+                  "staging", "development", "production", "test", "demo", "backup", "old"}
+
+    def query_subdomain(sub):
+        full_domain = f"{sub}.{domain}"
+        a_output = run_command(["dig", "+short", "A", full_domain], DNS_TIMEOUT)
+        aaaa_output = run_command(["dig", "+short", "AAAA", full_domain], DNS_TIMEOUT)
+        return extract_ips(a_output + aaaa_output)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(query_subdomain, sub) for sub in subdomains]
+        for future in concurrent.futures.as_completed(futures):
+            found_ips = future.result()
+            if found_ips:
+                ips.update(found_ips)
+    
+    return ips, other_records
+
+def get_ssl_cert_domains(domain):
+    """Gets Subject Alternative Names (SANs) from an SSL certificate."""
+    domains = set()
+    try:
+        # First method: openssl
+        cmd = f"openssl s_client -connect {domain}:443 -servername {domain} </dev/null 2>/dev/null | openssl x509 -noout -text"
+        output = run_command(["bash", "-c", cmd], SSL_TIMEOUT)
+        if output:
+            for san in re.findall(r"DNS:([\w\.\*-]+)", output):
+                if '.' in san:
+                    domains.add(san.replace('*.', ''))
+        
+        # Second method: curl (fallback)
+        if not domains:
+            cmd = f"curl -vs https://{domain} 2>&1 | grep 'subjectAltName:' | sed 's/.*DNS://g'"
+            output = run_command(["bash", "-c", cmd], SSL_TIMEOUT)
+            if output:
+                for san in re.findall(r"([\w\.\*-]+)", output):
+                    if '.' in san:
+                        domains.add(san.replace('*.', ''))
+    except Exception as e:
+        color_print(f"[-] SSL cert error: {e}", Fore.RED)
+    return sorted(list(domains))
+
+def get_asn_info(ip):
+    """Gets ASN information for a given IP address."""
+    try:
+        # First method: cymru.com
+        asn_cmd = ["dig", "+short", f"{ip}.origin.asn.cymru.com", "TXT"]
+        asn_output = run_command(asn_cmd, ASN_TIMEOUT)
+        if not asn_output:
+            # Fallback to ipinfo.io
+            asn_cmd = ["curl", "-s", f"https://ipinfo.io/{ip}/json"]
+            asn_output = run_command(asn_cmd, ASN_TIMEOUT)
+            if asn_output:
+                try:
+                    data = json.loads(asn_output)
+                    asn = data.get("org", "").split()[0].replace("AS", "")
+                    return {
+                        "asn": asn,
+                        "ip": ip,
+                        "description": data.get("org", "")
+                    }
+                except:
+                    return None
+        
+        asn_match = re.search(r'"(\d+) \|', asn_output)
+        if not asn_match:
+            return None
+        asn = asn_match.group(1)
+        
+        # Get ASN description
+        desc_cmd = ["dig", "+short", f"AS{asn}.asn.cymru.com", "TXT"]
+        desc_output = run_command(desc_cmd, ASN_TIMEOUT)
+        description = "Lookup not performed"
+        if desc_output:
+            desc_match = re.search(r'"(.+)"', desc_output)
+            if desc_match:
+                description = desc_match.group(1)
+        
+        return {
+            "asn": asn,
+            "ip": ip,
+            "description": description
+        }
+    except Exception as e:
+        color_print(f"[-] ASN error for {ip}: {e}", Fore.RED)
+        return None
+
+def run_reverse_dns(ips, resolver="1.1.1.1", output_dir="."):
+    """Performs reverse DNS lookups using parallel dig commands."""
+    if not ips:
+        color_print("\n[-] No IPs for reverse DNS lookup.", Fore.YELLOW)
+        return {}
+    
+    color_print(f"\n[+] Performing reverse DNS lookups for {len(ips)} IPs in parallel...", Fore.CYAN, Style.BRIGHT)
+    results = {}
+    
+    def process_ip(ip):
+        try:
+            cmd = ["dig", "+short", "-x", ip, f"@{resolver}"]
+            output = run_command(cmd, DNS_TIMEOUT)
+            if output:
+                domains = [domain.strip().rstrip('.') for domain in output.splitlines() if domain.strip()]
+                if domains:
+                    return ip, domains
+        except Exception as e:
+            color_print(f"[-] Reverse DNS error for {ip}: {e}", Fore.RED)
+        return ip, []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_ip = {executor.submit(process_ip, ip): ip for ip in ips}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                result_ip, domains = future.result()
+                if domains:
+                    results[result_ip] = domains
+            except Exception as e:
+                color_print(f"[-] Error processing reverse DNS for {ip}: {e}", Fore.RED)
+    
+    output_filename = os.path.join(output_dir, "reverse_dns.json")
+    with open(output_filename, "w") as f:
+        json.dump(results, f, indent=4)
+    color_print(f"✅ Reverse DNS results saved to {output_filename}", Fore.GREEN)
+    return results
+
+def run_masscan(ipv4, output_dir, full_scan=False):
+    """Runs masscan for IPv4 addresses with a loading animation."""
+    if not ipv4:
+        return
+
+    stop_animation = False
+    def animate():
+        """The animation function using braille characters for a circle."""
+        chars = "⢿⣻⣽⣾⣷⣯⣟⡿" 
+        idx = 0
+        while not stop_animation:
+            message = f"    {Style.BRIGHT}{Fore.CYAN}[*] Scanning {len(ipv4)} IPv4 addresses with masscan... {chars[idx % len(chars)]}{Style.RESET_ALL}"
+            sys.stdout.write(message)
+            sys.stdout.flush()
+            sys.stdout.write('\r')
+            idx += 1
+            time.sleep(0.1)
+        # Clear the animation line
+        sys.stdout.write(' ' * (len(message) + 5) + '\r')
+        sys.stdout.flush()
+
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".txt", prefix="ips_") as tmpfile:
+        tmpfile.write("\n".join(ipv4))
+        ip_list_filename = tmpfile.name
+    
+    output_filename = os.path.join(output_dir, "masscan_open_ports.grep")
+    ports_option = ["--top-ports", "1000"] if not full_scan else ["-p1-65535"]
+    
+    masscan_cmd = ["sudo", "masscan", "--open", "--wait", "5", "--retries", "3"] + ports_option + [
+        "-iL", ip_list_filename, "-oG", output_filename
+    ]
+
+    animation_thread = Thread(target=animate)
+    try:
+        animation_thread.start()
+        process = subprocess.Popen(
+            masscan_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(timeout=PORT_SCAN_TIMEOUT)
+        
+        stop_animation = True
+        animation_thread.join()
+
+        if process.returncode == 0:
+            color_print(f"    ✅ Masscan complete. Results saved to {output_filename}", Fore.GREEN)
+        else:
+            color_print(f"    [-] Masscan finished with errors.", Fore.RED)
+            if stderr:
+                error_summary = stderr.strip().split('\n')[-1]
+                color_print(f"    [-] Error: {error_summary}", Fore.RED, Style.DIM)
+
+        # Add discovered IPs to ips.txt
+        try:
+            with open(output_filename, 'r') as f:
+                masscan_ips = extract_ips(f.read())
+            if masscan_ips:
+                ips_file_path = os.path.join(output_dir, "ips.txt")
+                existing_ips = set()
+                if os.path.exists(ips_file_path):
+                    with open(ips_file_path, 'r') as rf:
+                        existing_ips = set(line.strip() for line in rf if line.strip())
+                
+                new_ips = masscan_ips - existing_ips
+                if new_ips:
+                    with open(ips_file_path, 'a') as f:
+                        f.write("\n" + "\n".join(new_ips) + "\n")
+                    color_print(f"    [+] Added {len(new_ips)} new IPs from masscan to {ips_file_path}", Fore.GREEN)
+        except Exception as e:
+            color_print(f"    [-] Error processing masscan results: {e}", Fore.RED)
+    except subprocess.TimeoutExpired:
+        stop_animation = True
+        animation_thread.join()
+        process.kill()
+        color_print(f"    [-] Masscan timed out and was terminated.", Fore.RED)
+    except Exception as e:
+        if animation_thread.is_alive():
+            stop_animation = True
+            animation_thread.join()
+        color_print(f"    [-] Masscan execution failed: {e}", Fore.RED)
+    finally:
+        os.remove(ip_list_filename)
+
+
+def run_nmap_for_ipv6(ip, output_dir, full_scan=False):
+    """Runs nmap for a single IPv6 address."""
+    output_filename = os.path.join(output_dir, f"nmap_{ip.replace(':', '_')}.txt")
+    ports_option = ["--top-ports", "1000"] if not full_scan else ["-p-"]
+    
+    nmap_cmd = [
+        "sudo", "nmap", "-6", "--open", "-T4", *ports_option,
+        "-oG", output_filename, ip
+    ]
+
+    try:
+        color_print(f"    [+] Scanning {ip}", Fore.MAGENTA)
+        process = subprocess.Popen(
+            nmap_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                color_print(f"        {output.strip()}", Fore.MAGENTA)
+        
+        color_print(f"    ✅ Nmap results saved to {output_filename}", Fore.GREEN)
+        
+        # Add discovered IPs to ips.txt
+        try:
+            with open(output_filename, 'r') as f:
+                nmap_ips = extract_ips(f.read())
+            if nmap_ips:
+                with open(os.path.join(output_dir, "ips.txt"), 'a') as f:
+                    f.write("\n".join(nmap_ips) + "\n")
+                color_print(f"    [+] Added {len(nmap_ips)} IPs from nmap to ips.txt", Fore.GREEN)
+        except Exception as e:
+            color_print(f"    [-] Error processing nmap IPs: {e}", Fore.RED)
+    except Exception as e:
+        color_print(f"    [-] Nmap error for {ip}: {e}", Fore.RED)
+
+def run_port_scan(ips, output_dir, full_scan=False):
+    """Runs optimized port scans with real-time output and parallel processing."""
+    if not ips:
+        color_print("\n[-] No IPs for port scan.", Fore.YELLOW)
+        return
+    
+    # Separate IPv4 and IPv6 addresses
+    ipv4 = [ip for ip in ips if ipaddress.ip_address(ip).version == 4]
+    ipv6 = [ip for ip in ips if ipaddress.ip_address(ip).version == 6]
+    
+    color_print(f"\n[+] Starting port scan on {len(ips)} IPs ({len(ipv4)} IPv4, {len(ipv6)} IPv6)...", 
+               Fore.CYAN, Style.BRIGHT)
+
+    # Run masscan and nmap in parallel
+    threads = []
+    
+    # Start masscan thread for IPv4
+    if ipv4:
+        masscan_thread = Thread(target=run_masscan, args=(ipv4, output_dir, full_scan))
+        masscan_thread.start()
+        threads.append(masscan_thread)
+    
+    # Start nmap scans for IPv6 in parallel
+    if ipv6:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_NMAP_WORKERS) as executor:
+            executor.map(lambda ip: run_nmap_for_ipv6(ip, output_dir, full_scan), ipv6)
+    
+    # Wait for masscan to finish
+    for thread in threads:
+        thread.join()
+
+def save_results(results, output_dir):
+    """Saves results to files and ensures IP uniqueness."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Ensure IPs are unique
+    unique_ips = set(results.get("ips", []))
+    
+    # Save unique IPs
+    with open(os.path.join(output_dir, "ips.txt"), "w") as f:
+        f.write("\n".join(unique_ips) + "\n")
+    
+    if results.get("asn_info"):
+        with open(os.path.join(output_dir, "asn_info.json"), "w") as f:
+            json.dump(results["asn_info"], f, indent=4)
+    if results.get("other_records"):
+        with open(os.path.join(output_dir, "dns_records.json"), "w") as f:
+            json.dump(results["other_records"], f, indent=4)
+    if results.get("ssl_cert_domains"):
+        with open(os.path.join(output_dir, "ssl_cert_domains.txt"), "w") as f:
+            f.write("\n".join(results["ssl_cert_domains"]) + "\n")
+    if results.get("reverse_dns"):
+        with open(os.path.join(output_dir, "reverse_dns.json"), "w") as f:
+            json.dump(results["reverse_dns"], f, indent=4)
+    color_print(f"\n[+] Results saved to {output_dir}", Fore.GREEN)
+
+def sort_ips(ip_list):
+    """Sorts a list of IP addresses."""
+    ipv4 = []
+    ipv6 = []
+    for ip in ip_list:
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.version == 4:
+                ipv4.append(ip)
+            elif addr.version == 6:
+                ipv6.append(ip)
+        except ValueError:
+            continue
+    return sorted(ipv4, key=ipaddress.ip_address) + sorted(ipv6, key=ipaddress.ip_address)
+
+def get_cidr_for_asn(asn):
+    """Fetches CIDR ranges for a given ASN using whois."""
+    cmd = f"whois -h whois.radb.net -- '-i origin AS{asn}' | grep -Eo '([0-9.]+){{4}}/[0-9]+'"
+    output = run_command(["bash", "-c", cmd], CIDR_SCAN_TIMEOUT)
+    return [cidr for cidr in output.splitlines() if cidr]
+
+def collect_cidr_for_asns(asns):
+    """Collects unique CIDR ranges for a list of ASNs."""
+    all_cidrs = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(get_cidr_for_asn, asn): asn for asn in asns}
+        for future in concurrent.futures.as_completed(futures):
+            asn = futures[future]
+            try:
+                cidrs = future.result()
+                if cidrs:
+                    all_cidrs.update(cidrs)
+                    color_print(f"    [+] AS{asn}: Found {len(cidrs)} CIDR ranges", Fore.GREEN)
+            except Exception as e:
+                color_print(f"    [-] Error for AS{asn}: {e}", Fore.RED)
+    return sorted(list(all_cidrs))
+
+def scan_cidrs(cidrs, output_dir, resolver):
+    """Scans the specified CIDR ranges for reverse DNS lookups."""
+    for cidr in cidrs:
+        color_print(f"[+] Processing CIDR: {cidr}", Fore.CYAN)
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+            
+            # Skip large CIDR ranges
+            num_ips = network.num_addresses
+            if num_ips > MAX_CIDR_IPS:
+                color_print(f"    [!] Skipping CIDR {cidr} ({num_ips} IPs exceeds safety limit)", Fore.YELLOW)
+                continue
+                
+            ips = [str(ip) for ip in network.hosts()]
+            reverse_dns_results = {}
+            
+            color_print(f"    [+] Scanning {len(ips)} IPs in CIDR {cidr}...", Fore.CYAN)
+            
+            # Process in batches
+            batch_size = 500
+            for i in range(0, len(ips), batch_size):
+                batch = ips[i:i+batch_size]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    future_to_ip = {executor.submit(
+                        run_command, 
+                        ["dig", "+short", "-x", ip, f"@{resolver}"], 
+                        DNS_TIMEOUT
+                    ): ip for ip in batch}
+                    
+                    for future in concurrent.futures.as_completed(future_to_ip):
+                        ip = future_to_ip[future]
+                        try:
+                            output = future.result()
+                            if output:
+                                domains = [domain.strip().rstrip('.') for domain in output.splitlines() if domain.strip()]
+                                if domains:
+                                    reverse_dns_results[ip] = domains
+                        except Exception as e:
+                            color_print(f"        [-] Error for {ip}: {e}", Fore.RED)
+                
+                color_print(f"        [+] Processed {min(i+batch_size, len(ips))} of {len(ips)} IPs", Fore.CYAN)
+            
+            safe_cidr = cidr.replace('/', '_')
+            output_file = os.path.join(output_dir, f"reverse_dns_{safe_cidr}.json")
+            with open(output_file, "w") as f:
+                json.dump(reverse_dns_results, f, indent=4)
+            color_print(f"    [+] Saved reverse DNS results for {cidr} to {output_file}", Fore.GREEN)
+        except Exception as e:
+            color_print(f"    [-] Error processing CIDR {cidr}: {e}", Fore.RED)
+
+def main():
+    parser = argparse.ArgumentParser(description="Enhanced DNS and network reconnaissance tool with colored output.")
+    parser.add_argument("target", help="Domain or URL to investigate")
+    parser.add_argument("-o", "--output", default="recon_results", help="Output directory base name")
+    parser.add_argument("--scan-ports", action="store_true", help="Run port scan (requires sudo)")
+    parser.add_argument("--full-scan", action="store_true", help="Scan all ports")
+    parser.add_argument("--rev-dns", action="store_true", help="Perform reverse DNS lookups")
+    parser.add_argument("--resolver", default="1.1.1.1", help="DNS resolver for reverse lookups")
+    parser.add_argument("--scan-cidrs", help="CIDRs to scan (comma-separated or 'all')")
+    parser.add_argument("--max-cidrs", type=int, help="Maximum number of CIDRs to scan")
+    parser.add_argument("--max-cidr-ips", type=int, default=MAX_CIDR_IPS, 
+                        help=f"Maximum IPs per CIDR to scan (default: {MAX_CIDR_IPS})")
+    args = parser.parse_args()
+
+    global MAX_CIDR_IPS
+    MAX_CIDR_IPS = args.max_cidr_ips
+
+    if args.scan_ports and os.geteuid() != 0:
+        color_print("[-] Port scanning requires root privileges. Use 'sudo'.", Fore.RED)
+        sys.exit(1)
+
+    try:
+        domain = extract_domain(args.target)
+    except ValueError as e:
+        color_print(f"[-] {e}", Fore.RED)
+        sys.exit(1)
+
+    output_dir = f"{args.output}_{domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    color_print(f"[+] Starting reconnaissance for: {domain}", Fore.CYAN, Style.BRIGHT)
+    color_print(f"[+] Results will be saved in: {output_dir}", Fore.CYAN)
+    color_print("[+] WARNING: Some commands may run for a long time without explicit timeouts.", Fore.YELLOW)
+
+    results = {"ips": set(), "asn_info": {}, "other_records": [], "ssl_cert_domains": []}
+
+    # Phase 1: Enhanced DNS Reconnaissance
+    color_print("\n[=== PHASE 1: DNS RECONNAISSANCE ===]", Fore.BLUE, Style.BRIGHT)
+    ips, other_records = get_dns_info(domain)
+    results["ips"].update(ips)
+    results["other_records"] = other_records
+    color_print(f"[+] Found {len(ips)} IP addresses for main domain", Fore.GREEN)
+
+    # Phase 2: SSL Certificate Analysis
+    color_print("\n[=== PHASE 2: SSL CERTIFICATE ANALYSIS ===]", Fore.BLUE, Style.BRIGHT)
+    ssl_domains = get_ssl_cert_domains(domain)
+    results["ssl_cert_domains"] = ssl_domains
+    color_print(f"[+] Found {len(ssl_domains)} domains in SSL certificate", Fore.GREEN)
+
+    # Phase 3: SSL Domain Resolution
+    if ssl_domains:
+        color_print("\n[=== PHASE 3: SSL DOMAIN RESOLUTION ===]", Fore.BLUE, Style.BRIGHT)
+        color_print(f"[+] Resolving IPs for {len(ssl_domains)} SSL domains...", Fore.CYAN)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_domain = {executor.submit(get_dns_info, san_domain): san_domain for san_domain in ssl_domains if san_domain != domain}
+            for future in concurrent.futures.as_completed(future_to_domain):
+                domain_name = future_to_domain[future]
+                try:
+                    san_ips, _ = future.result()
+                    if san_ips:
+                        results["ips"].update(san_ips)
+                        color_print(f"    [+] {domain_name}: Found {len(san_ips)} IPs", Fore.GREEN)
+                except Exception as e:
+                    color_print(f"    [-] Error resolving {domain_name}: {e}", Fore.RED)
+
+    # Phase 4: ASN Lookup
+    color_print("\n[=== PHASE 4: ASN LOOKUP ===]", Fore.BLUE, Style.BRIGHT)
+    ips_count = len(results["ips"])
+    color_print(f"[+] Fetching ASN information for {ips_count} IPs...", Fore.CYAN)
+    asn_count = 0
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_ip = {executor.submit(get_asn_info, ip): ip for ip in results["ips"]}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                asn_data = future.result()
+                if asn_data:
+                    results["asn_info"][ip] = asn_data
+                    asn_count += 1
+            except Exception as e:
+                color_print(f"    [-] Error processing {ip}: {e}", Fore.RED)
+    
+    color_print(f"[+] Found ASN information for {asn_count}/{ips_count} IPs", Fore.GREEN)
+
+    # Collect CIDR ranges for ASNs
+    color_print("\n[=== COLLECTING CIDR RANGES FOR ASNS ===]", Fore.BLUE, Style.BRIGHT)
+    unique_asns = sorted(list(set(asn_data["asn"] for asn_data in results["asn_info"].values() if asn_data.get("asn"))))
+    collected_cidrs = []
+    if unique_asns:
+        collected_cidrs = collect_cidr_for_asns(unique_asns)
+        with open(os.path.join(output_dir, "asn_cidrs.txt"), "w") as f:
+            f.write("\n".join(collected_cidrs) + "\n")
+        color_print(f"[+] Collected {len(collected_cidrs)} CIDR ranges for {len(unique_asns)} ASNs", Fore.GREEN)
+    else:
+        color_print("[+] No ASNs found to collect CIDR ranges for.", Fore.YELLOW)
+
+
+    # Convert set to sorted list
+    results["ips"] = sort_ips(list(results["ips"]))
+
+    # Phase 5: Reverse DNS Lookups
+    if args.rev_dns:
+        color_print("\n[=== PHASE 5: REVERSE DNS LOOKUP ===]", Fore.BLUE, Style.BRIGHT)
+        results["reverse_dns"] = run_reverse_dns(results["ips"], args.resolver, output_dir)
+
+    # Phase 6: Save Results
+    color_print("\n[=== PHASE 6: SAVING RESULTS ===]", Fore.BLUE, Style.BRIGHT)
+    save_results(results, output_dir)
+    
+    # Phase 7: CIDR Scanning (Optional)
+    cidrs_to_scan = []
+    if args.scan_cidrs:
+        color_print("\n[=== PHASE 7: CIDR SCANNING ===]", Fore.BLUE, Style.BRIGHT)
+        if args.scan_cidrs.lower() == "all":
+            cidrs_to_scan = collected_cidrs
+        else:
+            cidrs_to_scan = [cidr.strip() for cidr in args.scan_cidrs.split(',')]
+        if args.max_cidrs is not None:
+            cidrs_to_scan = cidrs_to_scan[:args.max_cidrs]
+        valid_cidrs = []
+        for cidr in cidrs_to_scan:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+                valid_cidrs.append(cidr)
+            except ValueError:
+                color_print(f"[-] Invalid CIDR: {cidr}", Fore.RED)
+        cidrs_to_scan = valid_cidrs
+        if cidrs_to_scan:
+            color_print(f"[+] Scanning {len(cidrs_to_scan)} CIDRs...", Fore.CYAN)
+            scan_cidrs(cidrs_to_scan, output_dir, args.resolver)
+        else:
+            color_print("[-] No valid CIDRs to scan.", Fore.RED)
+
+    # Phase 8: Port Scanning
+    if args.scan_ports:
+        color_print("\n[=== PHASE 8: PORT SCANNING ===]", Fore.BLUE, Style.BRIGHT)
+        run_port_scan(results["ips"], output_dir, args.full_scan)
+
+    color_print("\n✅ RECONNAISSANCE COMPLETE!", Fore.GREEN, Style.BRIGHT)
+    color_print(f"  - Unique IPs Found: {len(results['ips'])}", Fore.YELLOW)
+    color_print(f"  - SSL SANs Found: {len(results.get('ssl_cert_domains', []))}", Fore.YELLOW)
+    color_print(f"  - IPs with ASN Info: {len(results['asn_info'])}", Fore.YELLOW)
+    if args.rev_dns:
+        count = len(results.get("reverse_dns", {}))
+        color_print(f"  - IPs with Reverse DNS: {count}", Fore.YELLOW)
+    if args.scan_cidrs:
+        color_print(f"  - CIDRs Scanned: {len(cidrs_to_scan)}", Fore.YELLOW)
+
+if __name__ == "__main__":
+    main()
