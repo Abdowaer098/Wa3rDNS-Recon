@@ -60,7 +60,7 @@ Follow these steps to install and configure `wa3rdns` for easy use from anywhere
 **1. Clone the Repository**
 
 ```bash
-git clone https://github.com/Abdowaer098/wa3rdns.git
+git clone [https://github.com/Abdowaer098/wa3rdns.git](https://github.com/Abdowaer098/Wa3rDNS-Recon.git)
 cd wa3rdns
 ```
 
